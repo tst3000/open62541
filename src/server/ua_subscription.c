@@ -19,6 +19,7 @@ UA_Subscription *UA_Subscription_new(UA_UInt32 subscriptionID) {
     LIST_INIT(&new->MonitoredItems);
     LIST_INIT(&new->unpublishedNotifications);
     new->unpublishedNotificationsSize = 0;
+    LIST_INIT(&new->queuedPublishRequests);
     return new;
 }
 
@@ -42,6 +43,14 @@ void UA_Subscription_deleteMembers(UA_Subscription *subscription, UA_Server *ser
         Subscription_unregisterUpdateJob(server, subscription);
         UA_free(subscription->timedUpdateJob);
     }
+    UA_queuedPublishRequest *qpr, *tmp_qpr;
+    LIST_FOREACH_SAFE(qpr, &subscription->queuedPublishRequests, listEntry, tmp_qpr) {
+        LIST_REMOVE(qpr, listEntry);
+        if (qpr->publishRequest) {
+            UA_PublishRequest_delete(qpr->publishRequest);
+        }
+        UA_free(qpr);
+    }
 }
 
 void Subscription_generateKeepAlive(UA_Subscription *subscription) {
@@ -62,7 +71,11 @@ void Subscription_generateKeepAlive(UA_Subscription *subscription) {
     subscription->keepAliveCount.currentValue = subscription->keepAliveCount.maxValue;
 }
 
-void Subscription_updateNotifications(UA_Subscription *subscription) {
+extern void
+Service_Publish(UA_Server *server, UA_Session *session,
+                const UA_PublishRequest *request, UA_UInt32 requestId);
+
+void Subscription_updateNotifications(UA_Server *server, UA_Subscription *subscription) {
     UA_MonitoredItem *mon;
     //MonitoredItem_queuedValue *queuedValue;
     UA_unpublishedNotification *msg;
@@ -144,8 +157,25 @@ void Subscription_updateNotifications(UA_Subscription *subscription) {
             // FIXME: Constructing a EventListNotification is not implemented
         }
     }
+
+
     LIST_INSERT_HEAD(&subscription->unpublishedNotifications, msg, listEntry);
     subscription->unpublishedNotificationsSize += 1;
+    
+    UA_queuedPublishRequest *qpr, *tmp_qpr;
+    LIST_FOREACH_SAFE(qpr, &subscription->queuedPublishRequests, listEntry, tmp_qpr) {
+        UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "Handling queued request id %i", qpr->requestId);
+        LIST_REMOVE(qpr, listEntry);
+
+        Service_Publish(server, (UA_Session*) qpr->session, qpr->publishRequest, qpr->requestId);
+
+        if (qpr->publishRequest) {
+            UA_PublishRequest_delete(qpr->publishRequest);
+        }
+        UA_free(qpr);
+    }
+    
+
 }
 
 UA_UInt32 *Subscription_getAvailableSequenceNumbers(UA_Subscription *sub) {
@@ -212,7 +242,7 @@ static void Subscription_timedUpdateNotificationsJob(UA_Server *server, void *da
     LIST_FOREACH(mon, &sub->MonitoredItems, listEntry)
         MonitoredItem_QueuePushDataValue(server, mon);
     
-    Subscription_updateNotifications(sub);
+    Subscription_updateNotifications(server, sub);
 }
 
 UA_StatusCode Subscription_createdUpdateJob(UA_Server *server, UA_Guid jobId, UA_Subscription *sub) {
@@ -234,6 +264,9 @@ UA_StatusCode Subscription_createdUpdateJob(UA_Server *server, UA_Guid jobId, UA
 }
 
 UA_StatusCode Subscription_registerUpdateJob(UA_Server *server, UA_Subscription *sub) {
+
+    UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "registerUpdateJob: %lf", sub->publishingInterval);
+    
     if(sub->publishingInterval <= 5 ) 
         return UA_STATUSCODE_BADNOTSUPPORTED;
     
@@ -419,11 +452,14 @@ void MonitoredItem_QueuePushDataValue(UA_Server *server, UA_MonitoredItem *monit
   
     if(!monitoredItem || monitoredItem->lastSampled + monitoredItem->samplingInterval > UA_DateTime_now())
         return;
-  
+
+	
     // FIXME: Actively suppress non change value based monitoring. There should be
     // another function to handle status and events.
-    if(monitoredItem->monitoredItemType != MONITOREDITEM_TYPE_CHANGENOTIFY)
+    if(monitoredItem->monitoredItemType != MONITOREDITEM_TYPE_CHANGENOTIFY) {
+    	UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "unsupported monitoredItemType: %d", monitoredItem->monitoredItemType);
         return;
+    }
 
     MonitoredItem_queuedValue *newvalue = UA_malloc(sizeof(MonitoredItem_queuedValue));
     if(!newvalue)
@@ -444,14 +480,17 @@ void MonitoredItem_QueuePushDataValue(UA_Server *server, UA_MonitoredItem *monit
   
     UA_Boolean samplingError = MonitoredItem_CopyMonitoredValueToVariant(monitoredItem->attributeID, target,
                                                                          &newvalue->value);
+    
+    unsigned char* nm = target->browseName.name.data ? target->browseName.name.data : NULL;
 
     if(samplingError != false || !newvalue->value.value.type) {
         UA_DataValue_deleteMembers(&newvalue->value);
         UA_free(newvalue);
         return;
     }
-  
+
     if(monitoredItem->queueSize.currentValue >= monitoredItem->queueSize.maxValue) {
+    	UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "mi: %s removing from queue", nm);
         if(monitoredItem->discardOldest != true) {
             // We cannot remove the oldest value and theres no queue space left. We're done here.
             UA_DataValue_deleteMembers(&newvalue->value);
@@ -489,15 +528,18 @@ void MonitoredItem_QueuePushDataValue(UA_Server *server, UA_MonitoredItem *monit
         UA_free(newValueAsByteString.data);
     } else {
         if(UA_String_equal(&newValueAsByteString, &monitoredItem->lastSampledValue) == true) {
+    	UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "mi: %p %s same value...", monitoredItem, nm);
             UA_DataValue_deleteMembers(&newvalue->value);
             UA_free(newvalue);
             UA_String_deleteMembers(&newValueAsByteString);
             return;
         }
+    	UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "mi: %p %s changed", monitoredItem, nm);
         UA_ByteString_deleteMembers(&monitoredItem->lastSampledValue);
         monitoredItem->lastSampledValue = newValueAsByteString;
         TAILQ_INSERT_HEAD(&monitoredItem->queue, newvalue, listEntry);
         monitoredItem->queueSize.currentValue++;
         monitoredItem->lastSampled = UA_DateTime_now();
+        UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "queueSize: %d", monitoredItem->queueSize.currentValue);
     }
 }

@@ -71,6 +71,13 @@ typedef struct UA_unpublishedNotification {
     UA_NotificationMessage notification;
 } UA_unpublishedNotification;
 
+typedef struct UA_queuedPublishRequest {
+    LIST_ENTRY(UA_queuedPublishRequest) listEntry;
+    UA_PublishRequest *publishRequest;
+    UA_UInt32 requestId;
+    void *session;
+} UA_queuedPublishRequest;
+
 typedef struct UA_Subscription {
     LIST_ENTRY(UA_Subscription) listEntry;
     UA_UInt32_BoundedValue lifeTime;
@@ -88,11 +95,13 @@ typedef struct UA_Subscription {
     LIST_HEAD(UA_ListOfUnpublishedNotifications, UA_unpublishedNotification) unpublishedNotifications;
     size_t unpublishedNotificationsSize;
     LIST_HEAD(UA_ListOfUAMonitoredItems, UA_MonitoredItem) MonitoredItems;
+   
+    LIST_HEAD(UA_ListOfQueuedPublishRequests, UA_queuedPublishRequest) queuedPublishRequests;
 } UA_Subscription;
 
 UA_Subscription *UA_Subscription_new(UA_UInt32 subscriptionID);
 void UA_Subscription_deleteMembers(UA_Subscription *subscription, UA_Server *server);
-void Subscription_updateNotifications(UA_Subscription *subscription);
+void Subscription_updateNotifications(UA_Server *server, UA_Subscription *subscription);
 UA_UInt32 *Subscription_getAvailableSequenceNumbers(UA_Subscription *sub);
 void Subscription_generateKeepAlive(UA_Subscription *subscription);
 void Subscription_copyTopNotificationMessage(UA_NotificationMessage *dst, UA_Subscription *sub);

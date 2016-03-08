@@ -25,6 +25,9 @@ void Service_CreateSubscription(UA_Server *server, UA_Session *session,
     /* set the publishing interval */
     UA_BOUNDEDVALUE_SETWBOUNDS(session->subscriptionManager.globalPublishingInterval,
                                request->requestedPublishingInterval, response->revisedPublishingInterval);
+
+    UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "requestedInterval: %lf", request->requestedPublishingInterval);
+
     newSubscription->publishingInterval = response->revisedPublishingInterval;
     
     /* set the subscription lifetime (deleted when no publish requests arrive within this time) */
@@ -130,6 +133,7 @@ void Service_CreateMonitoredItems(UA_Server *server, UA_Session *session,
         createMonitoredItems(server, session, sub, &request->itemsToCreate[i], &response->results[i]);
 }
 
+
 void
 Service_Publish(UA_Server *server, UA_Session *session,
                 const UA_PublishRequest *request, UA_UInt32 requestId) {
@@ -172,11 +176,21 @@ Service_Publish(UA_Server *server, UA_Session *session,
             
             // FIXME: We are forcing notification updates for the subscription. This
             // should be done by a timed work item.
-            Subscription_updateNotifications(sub);
+            Subscription_updateNotifications(server, sub);
         }
         
-        if(sub->unpublishedNotificationsSize == 0)
+        if(sub->unpublishedNotificationsSize == 0) {
+            UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "unpublishedNotificationsSize == 0 for sub %i reqId %i handle %i", sub->subscriptionID, requestId, request->requestHeader.requestHandle);
+
+            UA_queuedPublishRequest *qpr = UA_calloc(1,sizeof(UA_queuedPublishRequest));
+            qpr->publishRequest = UA_PublishRequest_new();
+            UA_PublishRequest_copy(request, qpr->publishRequest);
+            qpr->requestId = requestId;
+            qpr->session = session;
+            LIST_INSERT_HEAD(&sub->queuedPublishRequests, qpr, listEntry);
+
             continue;
+        }
         
         // This subscription has notifications in its queue (top NotificationMessage exists in the queue). 
         // Due to republish, we need to check if there are any unplublished notifications first ()
@@ -210,7 +224,9 @@ Service_Publish(UA_Server *server, UA_Session *session,
         // request, but currently we need to return something to the client. If no
         // subscriptions have notifications, force one to generate a keepalive so we
         // don't return an empty message
-        sub = LIST_FIRST(&manager->serverSubscriptions);
+	//
+
+        /*sub = LIST_FIRST(&manager->serverSubscriptions);
         if(sub) {
             response.subscriptionId = sub->subscriptionID;
             sub->keepAliveCount.currentValue=sub->keepAliveCount.minValue;
@@ -218,14 +234,16 @@ Service_Publish(UA_Server *server, UA_Session *session,
             Subscription_copyNotificationMessage(&response.notificationMessage,
                                                  LIST_FIRST(&sub->unpublishedNotifications));
             Subscription_deleteUnpublishedNotification(sub->sequenceNumber + 1, false, sub);
-        }
+        }*/
+    	UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_SERVER, "no response");
+
+    } else {
+	    UA_SecureChannel *channel = session->channel;
+	    if(channel && have_response)
+		UA_SecureChannel_sendBinaryMessage(channel, requestId, &response,
+						   &UA_TYPES[UA_TYPES_PUBLISHRESPONSE]);
+	    UA_PublishResponse_deleteMembers(&response);
     }
-    
-    UA_SecureChannel *channel = session->channel;
-    if(channel)
-        UA_SecureChannel_sendBinaryMessage(channel, requestId, &response,
-                                           &UA_TYPES[UA_TYPES_PUBLISHRESPONSE]);
-    UA_PublishResponse_deleteMembers(&response);
 }
 
 void
